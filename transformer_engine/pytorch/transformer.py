@@ -35,10 +35,17 @@ from transformer_engine.pytorch.constants import (
 from transformer_engine.pytorch.distributed import get_distributed_world_size
 from transformer_engine.pytorch.export import is_in_onnx_export_mode
 from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+import os
+import dw.functions
 
 
 warnings.filterwarnings("module", category=DeprecationWarning, module="transformer")
 
+def use_dw_add_enabled() -> bool:
+    return os.getenv("USE_DW_ADD", "0") == "1"
+
+def use_dw_dropout_enabled() -> bool:
+    return os.getenv("USE_DW_DROPOUT", "0") == "1"
 
 __all__ = ["TransformerLayer"]
 
@@ -868,11 +875,18 @@ class TransformerLayer(torch.nn.Module):
         else:
             if bias is not None and bias.numel() != 0:
                 hidden_state = hidden_state + bias
-            out = torch.nn.functional.dropout(
-                hidden_state, p=self.hidden_dropout, training=self.training
-            )
+            if use_dw_dropout_enabled():
+                out = dw.functions.DropoutFunction.apply(hidden_state, self.hidden_dropout, self.training)
+            else:
+                out = torch.nn.functional.dropout(
+                    hidden_state, p=self.hidden_dropout, training=self.training
+                )
             if drop_path is not None:
                 out = drop_path(out)
-            output = residual + out
+
+            if use_dw_add_enabled():
+                output = dw.functions.AddFunction.apply(residual,out)
+            else:
+                output = residual + out
 
         return output

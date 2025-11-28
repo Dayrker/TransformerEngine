@@ -153,6 +153,14 @@ else:
 # Float8CurrentScaling: fused_attn_bwd takes O in FP8 by default, this flag allows it in F16
 _dpa_fp8_cs_o_in_f16 = os.getenv("NVTE_DPA_FP8CS_O_in_F16", "1") == "1"
 
+import os
+import dw
+
+def use_dw_attn_matmul() -> bool:
+    return os.getenv("USE_DW_ATTN_MATMUL", "0") == "1"
+
+def use_dw_attn_matmul_fp8() -> bool:
+    return os.getenv("USE_DW_ATTN_MATMUL_FP8", "0") == "1"
 
 class FP8EmulationFunc(torch.autograd.Function):
     """
@@ -419,14 +427,24 @@ class UnfusedDotProductAttention(torch.nn.Module):
             )
 
         # Raw attention scores. [b * np, sq, sk]
+        # print(query_layer.shape, query_layer.dtype)
         if core_attention_bias_type == "no_bias":
-            matmul_result = torch.baddbmm(
-                matmul_result,
-                query_layer.transpose(0, 1),  # [b * np, sq, hn]
-                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-                beta=0.0,
-                alpha=scale,
-            ).view(*output_size)
+            if use_dw_attn_matmul() and False:
+                matmul_result = dw.functions.MatmulFunction.apply(
+                    query_layer.transpose(0, 1),
+                    key_layer.transpose(0, 1).transpose(1, 2),
+                    8 if use_dw_attn_matmul_fp8() else -1
+                ).view(*output_size)
+                matmul_result = scale * matmul_result
+            else:
+                # out = beta * matmul_result + alpha * (q... @ k...)
+                matmul_result = torch.baddbmm(
+                    matmul_result,
+                    query_layer.transpose(0, 1),                    # [b * np, sq, hn]
+                    key_layer.transpose(0, 1).transpose(1, 2),      # [b * np, hn, sk]
+                    beta=0.0,
+                    alpha=scale,
+                ).view(*output_size)
 
         elif core_attention_bias_type == "pre_scale_bias":
             assert core_attention_bias is not None, "core_attention_bias should not be None!"
@@ -493,7 +511,7 @@ class UnfusedDotProductAttention(torch.nn.Module):
 
         # attention scores and attention mask
         softmax_scale = self.layer_number if apply_qk_layer_scaling else None
-        attention_probs = self.scale_mask_softmax(
+        attention_probs = self.scale_mask_softmax(  # FusedScaleMaskSoftmax()中已更换dw
             matmul_result, attention_mask, attn_mask_type, softmax_scale
         )
 
@@ -533,7 +551,14 @@ class UnfusedDotProductAttention(torch.nn.Module):
             )
 
         # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        if use_dw_attn_matmul():
+            context_layer = dw.functions.MatmulFunction.apply(
+                attention_probs,                      # [B*H, sq, sk]
+                value_layer.transpose(0, 1),          # [B*H, sk, hn]
+                8 if use_dw_attn_matmul_fp8() else -1
+            )
+        else:
+            context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)

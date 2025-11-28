@@ -88,9 +88,41 @@ from ..cpp_extensions import (
 )
 from ..export import is_in_onnx_export_mode, assert_warmed_up
 from ...debug.pytorch.debug_state import TEDebugState
+import os
+import dw.functions as dwF
 
 __all__ = ["LayerNormMLP"]
 
+def use_dw_matmul_enabled() -> bool:
+    return os.getenv("USE_DW_MATMUL", "0") == "1"
+
+def use_dw_matmul_enabled_fp8() -> bool:
+    return os.getenv("USE_DW_MATMUL_FP8", "0") == "1"
+
+def use_dw_silu_enabled() -> bool:
+    return os.getenv("USE_DW_SILU", "0") == "1"
+
+def use_dw_add_enabled() -> bool:
+    return os.getenv("USE_DW_ADD", "0") == "1"
+
+def dw_silu_forward(x, quantizer=None):
+    x = x.contiguous() 
+    y = dwF.SiluFunction.apply(x)
+    if quantizer is not None:
+        y = quantizer(y)
+    return y
+
+def dw_swiglu_forward(x, quantizer=None):
+    x = x.contiguous() 
+    a, b = x.chunk(2, -1)
+    a = a.contiguous() 
+    b = b.contiguous()
+    # print("using dw swiglu forward")
+    y = dwF.SiluFunction.apply(a) * b
+    if quantizer is not None:
+        y = quantizer(y)
+    
+    return y
 
 def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
     if recipe is None:
@@ -111,6 +143,11 @@ def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
     if recipe.delayed() or recipe.mxfp8():
         # Delayed scaling, fusion supported list: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
         # MXFP8: [tex.dbias_dgelu, tex.dbias_drelu, tex.dbias_dqgelu, tex.dbias_dsrelu]
+        silu_fwd = tex.silu
+        swiglu_fwd = tex.swiglu
+        # if use_dw_silu_enabled():
+        #     silu_fwd = dw_silu_forward
+        #     swiglu_fwd = dw_swiglu_forward
         return {
             "gelu": (tex.gelu, tex.dgelu, tex.dbias_dgelu),
             "geglu": (tex.geglu, tex.dgeglu, None),
@@ -120,8 +157,8 @@ def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
             "reglu": (tex.reglu, tex.dreglu, None),
             "srelu": (tex.srelu, tex.dsrelu, tex.dbias_dsrelu),
             "sreglu": (tex.sreglu, tex.dsreglu, None),
-            "silu": (tex.silu, tex.dsilu, tex.dbias_dsilu),
-            "swiglu": (tex.swiglu, tex.dswiglu, None),
+            "silu": (silu_fwd, tex.dsilu, tex.dbias_dsilu),
+            "swiglu": (swiglu_fwd, tex.dswiglu, None),
             "clamped_swiglu": (tex.clamped_swiglu, tex.clamped_dswiglu, None),
         }
     # no activation fusion written yet
@@ -543,23 +580,36 @@ class _LayerNormMLP(torch.autograd.Function):
                 gemm_gelu_fusion = False
         if debug:
             gemm_gelu_fusion = False
-        fc1_outputs = general_gemm(
-            fc1_weight_final,
-            ln_out_total,
-            quantization_params=(
-                fc2_input_quantizer
-                if gemm_gelu_fusion
-                else fc1_output_quantizer  # fused gelu output is in fp8
-            ),
-            out_dtype=activation_dtype,
-            bias=(
-                fc1_bias if not bias_gelu_fusion else None
-            ),  # otherwise bias is added later (fused with gelu)
-            gelu=gemm_gelu_fusion,
-            use_split_accumulator=use_split_accumulator,
-            ub=ub_obj_lnout,
-            ub_type=tex.CommOverlapType.AG if ub_overlap_ag else None,
-        )
+
+        if use_dw_matmul_enabled():
+            A = fc1_weight_final.dequantize().to(activation_dtype)
+            B = ln_out_total.dequantize().to(activation_dtype)
+            fc1_outputs = dwF.MatmulFunction.apply(
+                B, 
+                A.T.contiguous(), 
+                8 if use_dw_matmul_enabled_fp8() else -1
+            )   # [M, N]
+            # print(fc1_outputs[0].shape, fc1_outputs[0].dtype)
+            fc1_outputs = (fc1_outputs, None, None, None)
+        else:
+            fc1_outputs = general_gemm(
+                fc1_weight_final,
+                ln_out_total,
+                quantization_params=(   # None
+                    fc2_input_quantizer
+                    if gemm_gelu_fusion
+                    else fc1_output_quantizer  # fused gelu output is in fp8
+                ),
+                out_dtype=activation_dtype,
+                bias=(  # None
+                    fc1_bias if not bias_gelu_fusion else None
+                ),  # otherwise bias is added later (fused with gelu)
+                gelu=gemm_gelu_fusion,  # False
+                use_split_accumulator=use_split_accumulator,    # False
+                ub=ub_obj_lnout,    # None
+                ub_type=tex.CommOverlapType.AG if ub_overlap_ag else None,  # None
+            )
+            # print(fc1_outputs[0].shape, fc1_outputs[0].dtype)
 
         # ------------------------------------------------------
         # Finished FC1 GEMM...
@@ -646,17 +696,26 @@ class _LayerNormMLP(torch.autograd.Function):
             # ------------------------------------------------------
             # FC2 GEMM
             # ------------------------------------------------------
-            gemm_out, *_, reduce_scatter_out = general_gemm(
-                fc2_weight_final,
-                act_out,
-                out_dtype=activation_dtype,
-                bias=fc2_bias,
-                quantization_params=fc2_output_quantizer,
-                use_split_accumulator=use_split_accumulator,
-                ub=ub_obj_fc2out,
-                ub_type=tex.CommOverlapType.RS if ub_overlap_rs else None,
-                extra_output=reduce_scatter_out,
-            )
+            if use_dw_matmul_enabled():
+                A = fc2_weight_final.dequantize().to(activation_dtype)
+                B = act_out.dequantize().to(activation_dtype)
+                gemm_out = dwF.MatmulFunction.apply(
+                    B, 
+                    A.T.contiguous(), 
+                    8 if use_dw_matmul_enabled_fp8() else -1
+                )   # [M, N]
+            else:
+                gemm_out, *_, reduce_scatter_out = general_gemm(
+                    fc2_weight_final,
+                    act_out,
+                    out_dtype=activation_dtype, # None
+                    bias=fc2_bias,  # None
+                    quantization_params=fc2_output_quantizer,   # None
+                    use_split_accumulator=use_split_accumulator,    # False
+                    ub=ub_obj_fc2out,   # None
+                    ub_type=tex.CommOverlapType.RS if ub_overlap_rs else None,  # None
+                    extra_output=reduce_scatter_out,    # None
+                )
             # ------------------------------------------------------
             # Finished FC2 GEMM...
             # ------------------------------------------------------
@@ -2166,7 +2225,10 @@ class LayerNormMLP(TransformerEngineBaseModule):
             out, ln_out = out
 
         if self.gemm_bias_unfused_add:
-            out = out + cast_if_needed(fc2_bias, self.activation_dtype)
+            if use_dw_add_enabled():
+                out = dw.functions.AddFunction.apply(out,cast_if_needed(fc2_bias, self.activation_dtype))
+            else:
+                out = out + cast_if_needed(fc2_bias, self.activation_dtype)
 
         if self.return_bias:
             if self.return_layernorm_output:

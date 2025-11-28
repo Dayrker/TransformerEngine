@@ -9,7 +9,8 @@ import torch
 from torch import nn
 import transformer_engine_torch as tex
 from transformer_engine.pytorch.export import is_in_onnx_export_mode
-
+import os
+import dw.functions as dwF
 
 THREADS_PER_WARP = 32
 THREADS_PER_BLOCK = 128
@@ -191,6 +192,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         """Check FusedScaleMaskSoftmax kernel availability based on size"""
         attn_batches = b * np
 
+        if os.getenv("USE_DW_SOFTMAX", "0") == "1":
+            return False
+
         if not self.scaled_masked_softmax_fusion_type:
             return False  # user doesn't want to fuse
         if not self.input_in_float16:
@@ -266,7 +270,11 @@ class FusedScaleMaskSoftmax(nn.Module):
         mask_output = inp
         if mask is not None and self.attn_mask_type != "no_mask":
             mask_output = self.mask_func(inp, mask)
-        probs = torch.nn.functional.softmax(mask_output, dim=-1)
+        
+        if os.getenv("USE_DW_SOFTMAX", "0") == "1":
+            probs = dwF.SoftmaxFunction.apply(mask_output, -1)
+        else:
+            probs = torch.nn.functional.softmax(mask_output, dim=-1)
 
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:

@@ -9,6 +9,8 @@ import abc
 from typing import Optional
 
 import torch
+import os
+import dw.functions
 
 import transformer_engine_torch as tex
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
@@ -16,6 +18,9 @@ from ...tensor.float8_tensor import Float8CurrentScalingQuantizer, Quantizer
 from ...utils import clear_tensor_data
 from ..op import BasicOperation, OperationContext
 from .._common import maybe_dequantize
+
+def use_dw_silu_enabled() -> bool:
+    return os.getenv("USE_DW_SILU", "0") == "1"
 
 __all__ = [
     "GELU",
@@ -351,6 +356,10 @@ class SiLU(_ActivationOperation):
     """
 
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        if use_dw_silu_enabled():
+            # print("using dw silu")
+            return dw.functions.SiluFunction.apply(input)
+
         return tex.silu(*args, **kwargs)
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:

@@ -24,6 +24,13 @@ __all__ = [
     "general_grouped_gemm",
 ]
 
+import dw.functions
+
+def use_dw_matmul_enabled() -> bool:
+    return os.getenv("USE_DW_MATMUL", "0") == "1"
+
+def use_dw_matmul_enabled_fp8() -> bool:
+    return os.getenv("USE_DW_MATMUL_FP8", "0") == "1"
 
 _NUM_MAX_UB_STREAMS = 3
 
@@ -109,11 +116,23 @@ def general_gemm(
     extra_output: Optional[torch.Tensor] = None,
     bulk_overlap: bool = False,
 ) -> Iterable[Optional[torch.Tensor]]:
+
+    # if use_dw_matmul_enabled():
+    #     # if use_dw_matmul_enabled() and not isinstance(A, (Float8TensorBase, Float8BlockwiseQTensorBase)) and not isinstance(B, (Float8TensorBase, Float8BlockwiseQTensorBase)):
+    #     return dw_gemm(
+    #         A,
+    #         B,
+    #         layout=layout,
+    #         out_dtype=out_dtype,
+    #         bias=bias,
+    #     )
+
     """GEMM supporting fp8 inputs."""
 
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
     transb = layout[1] == "T"
+    # TN -> True, False
     # assert quantization_params is None, "FP8 output not supported yet"
 
     alpha = validate_gemm_scale(alpha, True)
@@ -160,6 +179,7 @@ def general_gemm(
         quantization_params = quantization_params.parent_quantizer
         A = A.get_tensor(not transa)
         B = B.get_tensor(transb)
+    # print(f"[In general gemm] A: {A.dequantize().shape}, B: {B.dequantize().shape}")
 
     # Use bfloat16 as default bias_dtype
     bias_dtype = TE_DType[torch.bfloat16 if bias is None else bias.dtype]
@@ -208,6 +228,65 @@ def general_gemm(
     if debug_quantizer is not None:
         out = debug_quantizer.process_gemm_output(out)
 
+    return out, bias_grad, gelu_input, extra_output
+
+
+
+def dw_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    layout: str,
+    out_dtype: Optional[torch.dtype],
+    bias: Optional[torch.Tensor],
+):
+    """
+    DW forward GEMM replacement for tex.generic_gemm in simple forward cases.
+
+    A: [out_features, in_features]
+    B: [..., in_features]   (any rank >= 2)
+    Returns: [..., out_features], plus three Nones to match TE general_gemm API.
+    """
+    if layout != "TN":
+        # We only implement the standard TE forward layout:
+        #   y = x @ w^T  with call general_gemm(weight, input, layout="TN", ...)
+        raise NotImplementedError(f"DW GEMM only supports layout='TN', got {layout}.")
+
+    # W = A
+    # X = B
+
+    # # Remember original shape of X (B)
+    # orig_shape = X.shape          # e.g. [batch, seq, hidden]
+    # k = orig_shape[-1]
+    # n = W.shape[0]                # out_features
+
+    # # Cast to desired dtype
+    # act_dtype = out_dtype or X.dtype
+    # X = X.to(act_dtype)
+    # W = W.to(act_dtype)
+
+    # # Flatten all leading dims for GEMM
+    # X2 = X.contiguous().view(-1, k)      # [M, K]
+    # W2 = W.contiguous()                  # [N, K]
+    # BT = W2.transpose(-2, -1).contiguous()  # [K, N]
+
+    # Call your kernel
+    if use_dw_matmul_enabled_fp8():
+        out = dw.functions.MatmulFunction.apply(A.dequantize().to(out_dtype), B.dequantize().to(out_dtype), 8)   # [M, N]
+    else:
+        out = dw.functions.MatmulFunction.apply(A, B, -1)   # [M, N]
+
+    # Bias add
+    if bias is not None:
+        out = out + bias
+
+    # # >>> CRUCIAL: reshape back to original leading dims <<<
+    # out = out2.view(*orig_shape[:-1], n)    # [..., out_features]
+
+    # Match TE's general_gemm return convention
+    bias_grad = None
+    gelu_input = None
+    extra_output = None
     return out, bias_grad, gelu_input, extra_output
 
 

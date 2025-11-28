@@ -14,7 +14,11 @@ from .. import cpp_extensions as tex
 from ..constants import TE_DType
 from ..export import is_in_onnx_export_mode
 from ..utils import get_default_init_method
+import os
+import dw.functions
 
+def use_dw_layernorm_enabled():
+    return os.getenv("USE_DW_LAYERNORM", "0") == "1"
 
 def _get_normalization_func(normalization: str, forward: bool):
     fwd_normalization_funcs = {
@@ -25,6 +29,19 @@ def _get_normalization_func(normalization: str, forward: bool):
         "LayerNorm": tex.layernorm_bwd,
         "RMSNorm": tex.rmsnorm_bwd,
     }
+    
+    if use_dw_layernorm_enabled() and normalization == "LayerNorm":
+        if forward:
+            print("using dw layernorm fwd")
+            def dw_layernorm_fwd(inputmat, weight, bias, eps,
+                                 ln_out, quantizer, out_dtype,
+                                 fwd_ln_sm_margin, zero_centered_gamma):
+                out = dw.functions.LayernormFunction.apply(inputmat, weight, bias, eps)
+                mu = dw.functions.LayernormFunction.ctx_mu
+                rsigma = dw.functions.LayernormFunction.ctx_rsigma
+                return out, mu, rsigma
+
+            return dw_layernorm_fwd
 
     if forward:
         return fwd_normalization_funcs[normalization]

@@ -78,6 +78,14 @@ from ...debug.pytorch.debug_state import TEDebugState
 
 __all__ = ["Linear"]
 
+import dw
+import os 
+
+def use_dw_linear_enabled():
+    return os.getenv("USE_DW_LINEAR", "0") == "1"
+
+def use_dw_linear_fp8_enabled():
+    return os.getenv("USE_DW_LINEAR_FP8", "0") == "1"
 
 class _Linear(torch.autograd.Function):
     """Linear semi-top level module
@@ -1372,6 +1380,34 @@ class Linear(TransformerEngineBaseModule):
                                first microbatch (since it is the first gradient being
                                produced)
         """
+        if use_dw_linear_enabled():
+            input_shape = inp.shape
+            if inp.dim() == 3:
+                inp_reshaped = inp.view(-1, input_shape[-1])
+            else:
+                inp_reshaped = inp
+
+            if not inp_reshaped.is_contiguous():
+                inp_reshaped = inp_reshaped.contiguous()
+            
+            w = self.weight
+            b = self.bias if self.use_bias else None
+            if not w.is_contiguous(): w = w.contiguous()
+            if b is not None and not b.is_contiguous(): b = b.contiguous()
+
+            if use_dw_linear_fp8_enabled():
+                out = dw.functions.FcFunction.apply(inp_reshaped, w, b, 8)
+            else:
+                out = dw.functions.FcFunction.apply(inp_reshaped, w, b, -1)
+
+            if len(input_shape) == 3:
+                out = out.view(input_shape[0], input_shape[1], -1)
+
+            if self.return_bias:
+                return out, torch.zeros_like(out)
+            
+            return out
+
         is_grad_enabled = torch.is_grad_enabled()
 
         if is_in_onnx_export_mode():

@@ -63,6 +63,9 @@ _NVTE_FLASH_ATTN = int(os.getenv("NVTE_FLASH_ATTN", "1"))
 _print_layer = int(os.getenv("NVTE_PRINT_LAYER_NUMBER", "1"))
 _print_rank = int(os.getenv("NVTE_PRINT_RANK", "0"))
 
+def use_unfused_attn() -> bool:
+    return os.getenv("USE_UNFUSED_ATTN", "0") == "1"
+
 _cu_seqlens_cache = {}
 
 
@@ -1145,6 +1148,11 @@ def get_attention_backend(
         use_flash_attention = False
 
     # Selected backend
+    if use_unfused_attn():
+        use_unfused_attention = True
+        use_flash_attention = False
+        use_fused_attention = False
+
     if use_flash_attention:
         use_fused_attention = False
         use_unfused_attention = False
@@ -1157,7 +1165,9 @@ def get_attention_backend(
         selected_backend = f"FusedAttention (sub-backend {int(fused_attention_backend)})"
     elif use_unfused_attention:
         selected_backend = "UnfusedDotProductAttention"
-    logger.debug("Selected backend = %s", selected_backend)
+    
+    # print("selected_backend:", selected_backend, "fused_attention_backend:", fused_attention_backend)
+    logger.debug("Selected backend = %s", selected_backend) # llama3-8B -> FusedAttention (sub-backend 1)
 
     return (
         use_flash_attention,
