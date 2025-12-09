@@ -217,6 +217,10 @@ class _LayerNormMLP(torch.autograd.Function):
     ) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
         # pylint: disable=missing-function-docstring
 
+        # print("inp:", inp.shape, "ln_weight:", ln_weight.shape)
+        # print("fc1_weight:", fc1_weight.shape)
+        # print("fc2_weight:", fc2_weight.shape)
+
         # Reduce number of arguments to autograd function in order
         # to reduce CPU overhead due to pytorch arg checking.
         (
@@ -501,6 +505,7 @@ class _LayerNormMLP(torch.autograd.Function):
             ln_out_total = ln_out
 
         # Cast weights to expected dtype
+        # print("fc1_weight:", fc1_weight.shape)
         fc1_weight_final = fc1_weight
         fc2_weight_final = fc2_weight
         if fp8 or debug:
@@ -584,6 +589,7 @@ class _LayerNormMLP(torch.autograd.Function):
         if use_dw_matmul_enabled():
             A = fc1_weight_final.dequantize().to(activation_dtype)
             B = ln_out_total.dequantize().to(activation_dtype)
+            print("[In _LayerNormMLP] 1: ", B.shape, A.T.contiguous().shape)
             fc1_outputs = dwF.MatmulFunction.apply(
                 B, 
                 A.T.contiguous(), 
@@ -697,6 +703,7 @@ class _LayerNormMLP(torch.autograd.Function):
             # FC2 GEMM
             # ------------------------------------------------------
             if use_dw_matmul_enabled():
+                print("[In _LayerNormMLP] 2: ", B.shape, A.T.contiguous().shape)
                 A = fc2_weight_final.dequantize().to(activation_dtype)
                 B = act_out.dequantize().to(activation_dtype)
                 gemm_out = dwF.MatmulFunction.apply(
